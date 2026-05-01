@@ -5,3 +5,8 @@ desktop.ini
 *.swp
 .vscode/
 .idea/
+
+# Raw transit downloads — only the slimmed .min.geojson files belong in repo.
+web/data/transit/subway-lines.geojson
+web/data/transit/subway-stations.geojson
+web/data/transit/bus-routes.geojson
