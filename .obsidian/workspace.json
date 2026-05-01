@@ -185,6 +185,10 @@
   },
   "active": "1155e608acdaeabc",
   "lastOpenFiles": [
+    "scripts/deploy_portfolio.py",
+    "web/gate.js",
+    "web/firebase.js",
+    "web/firebase-config.js",
     "web/data/transit/bus-routes.min.geojson",
     "web/data/transit/subway-stations.min.geojson",
     "web/data/transit/subway-lines.min.geojson",
@@ -192,12 +196,8 @@
     "web/data/transit/bus-routes.geojson",
     "web/data/transit/subway-stations.geojson",
     "web/data/transit/subway-lines.geojson",
-    "web/data/transit",
     "CLAUDE.md",
     "web/README.md",
-    "web/app.js",
-    "web/styles.css",
-    "web/index.html",
     "neighborhoods/Bushwick.md",
     "AI-Tinkerers-NYC.md",
     "Tandon.md"

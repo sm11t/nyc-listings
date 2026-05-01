@@ -10,3 +10,8 @@ desktop.ini
 web/data/transit/subway-lines.geojson
 web/data/transit/subway-stations.geojson
 web/data/transit/bus-routes.geojson
+
+# Secrets — used by deploy_portfolio.py to encrypt the published listings blob.
+# Must never be committed: the password lives only here on the brain side.
+.env.local
+.env

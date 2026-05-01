@@ -1,21 +1,19 @@
 /* NYC Listings — map + interactions
- * Vanilla JS, Leaflet, OpenStreetMap.
- * Notes & status are persisted in localStorage under nyc-listings:notes / :status.
+ *
+ * Vanilla JS, Leaflet, OpenStreetMap. Notes & status sync through Firebase
+ * (window.NYCFirebase) when configured; otherwise fall back to per-browser
+ * localStorage so the page stays useful in dev / on a fork without config.
  */
 (() => {
   'use strict';
 
-  const STORAGE_NOTES = 'nyc-listings:notes:v1';
-  const STORAGE_STATUS = 'nyc-listings:status:v1';
-  const STATUS_OPTIONS = ['interested', 'contacted', 'scheduled', 'visited', 'rejected'];
-  const BBOX = {
-    // Brooklyn + Manhattan, generous padding
-    sw: [40.55, -74.12],
-    ne: [40.92, -73.78],
-  };
+  // ---------- constants ----------
+  const STORAGE_NOTES   = 'nyc-listings:notes:v2';
+  const STORAGE_STATUS  = 'nyc-listings:status:v1';
+  const STORAGE_AUTHOR  = 'nyc-listings:author:v1';
+  const STATUS_OPTIONS  = ['interested', 'contacted', 'scheduled', 'visited', 'rejected'];
+  const BBOX = { sw: [40.55, -74.12], ne: [40.92, -73.78] };
 
-  // Official-ish MTA route colors. Palette covers every NYCT subway service.
-  // Source: MTA NYCT subway map (single-letter/number trunk lines).
   const SUBWAY_COLORS = {
     '1': '#EE352E', '2': '#EE352E', '3': '#EE352E',
     '4': '#00933C', '5': '#00933C', '6': '#00933C', '6X': '#00933C',
@@ -40,26 +38,26 @@
     { letters: 'L',     color: SUBWAY_COLORS['L'], gray: true },
   ];
 
-  const el = (sel, root = document) => root.querySelector(sel);
+  const el  = (sel, root = document) => root.querySelector(sel);
   const els = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
   const state = {
     listings: [],
     filters: { search: '', minPrice: null, maxPrice: null, leases: new Set(), hoods: new Set() },
     selectedId: null,
-    notes: loadStore(STORAGE_NOTES),
-    status: loadStore(STORAGE_STATUS),
+    author: localStorage.getItem(STORAGE_AUTHOR) || '',
+    notesByListing: {},   // { listingId: [{ id, text, author, uid, createdAt }] }
+    noteCounts:    {},    // { listingId: count }  used for marker dot + sheet meta
+    status:        {},    // { listingId: 'interested' | ... }
+    currentNoteUnsub: null,
     markers: new Map(),
     map: null,
     panes: {},
-    layers: {
-      subway: null,
-      stations: null,
-      bus: null,
-      labels: null,  // CARTO labels tile layer
-    },
+    layers: { subway: null, stations: null, bus: null, labels: null },
+    backend: 'local',     // 'local' | 'firebase'
   };
 
+  // ---------- safe storage ----------
   function loadStore(key) {
     try { return JSON.parse(localStorage.getItem(key) || '{}'); } catch { return {}; }
   }
@@ -67,7 +65,7 @@
     try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { console.warn('storage failed', e); }
   }
 
-  // ---------- price tier classification ----------
+  // ---------- listing classifiers ----------
   function priceTier(l) {
     const p = l.price_sort;
     if (!p) return 'mid';
@@ -86,7 +84,6 @@
     if (t.includes('11')) return '11mo';
     return 'standard';
   }
-
   function fmtPrice(l) {
     if (l.price_per_bedroom) return `$${l.price_per_bedroom.toLocaleString()}`;
     if (l.price_per_bedroom_low && l.price_per_bedroom_high)
@@ -98,30 +95,33 @@
   async function init() {
     let payload;
     try {
-      const res = await fetch('data/listings.json');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      payload = await res.json();
+      // gate.js handles plaintext (dev) or encrypted (portfolio) automatically
+      payload = await window.NYCGate.loadListings();
     } catch (err) {
-      showFatal(`Could not load data/listings.json — ${err.message}. ` +
-        `If you opened this file directly, serve the folder over HTTP instead (e.g.  python -m http.server  inside the web/ folder).`);
+      showFatal(`Could not load listings — ${err.message}. ` +
+        `If you opened this file directly, serve the folder over HTTP instead (e.g. python -m http.server inside the web/ folder).`);
       return;
     }
 
     state.listings = payload.listings || [];
-
     el('#count-pill').textContent = `${state.listings.length} listings`;
-    el('#updated-date').textContent = inferDate(state.listings) || '—';
 
     setupMap();
     setupPanes();
     await loadTransitLayers();
     setupTransitToggles();
     renderSubwayLegend();
+    addNYUBrooklynMarker();
+
+    await initBackend();
+    setupAuthorInput();
+
     renderMarkers();
     renderQuickList();
     setupFilters();
     setupSearch();
-    bindActions();
+    setupChrome();
+    bindKeyboard();
   }
 
   function showFatal(msg) {
@@ -129,9 +129,89 @@
     map.innerHTML = `<div style="padding:2rem;color:var(--text-mute);max-width:42ch;line-height:1.5">${msg}</div>`;
   }
 
-  function inferDate(list) {
-    const dates = list.map((l) => (l.last_updated || '').match(/(\d{4}-\d{2}-\d{2})/)?.[1]).filter(Boolean);
-    return dates.sort().pop();
+  // ---------- backend: Firebase if available, otherwise local ----------
+  function initBackend() {
+    return new Promise((resolve) => {
+      const start = (fb) => {
+        if (fb && fb.enabled) {
+          fb.ready.then((ok) => {
+            if (ok) {
+              state.backend = 'firebase';
+              setSyncPill('synced', 'Notes synced via Firebase');
+              fb.onAllStatus((map) => {
+                state.status = map || {};
+                if (state.selectedId) refreshStatusChips();
+              });
+              fb.onAllNoteCounts((counts) => {
+                state.noteCounts = counts || {};
+                refreshAllMarkerDots();
+                if (state.selectedId) updateSheetSummary();
+              });
+            } else {
+              fallbackLocal();
+            }
+            resolve();
+          });
+        } else {
+          fallbackLocal();
+          resolve();
+        }
+      };
+
+      function fallbackLocal() {
+        state.backend = 'local';
+        // Migrate v1 single-textarea notes if present.
+        const legacy = loadStore('nyc-listings:notes:v1');
+        const v2 = loadStore(STORAGE_NOTES);
+        if (Object.keys(legacy).length && !Object.keys(v2).length) {
+          const migrated = {};
+          for (const [id, text] of Object.entries(legacy)) {
+            if (typeof text === 'string' && text.trim()) {
+              migrated[id] = [{
+                id: 'legacy',
+                text,
+                author: state.author || 'you',
+                createdAt: Date.now(),
+                uid: 'local',
+              }];
+            }
+          }
+          saveStore(STORAGE_NOTES, migrated);
+        }
+        state.notesByListing = loadStore(STORAGE_NOTES);
+        state.noteCounts = Object.fromEntries(
+          Object.entries(state.notesByListing).map(([k, v]) => [k, (v || []).length])
+        );
+        state.status = loadStore(STORAGE_STATUS);
+        setSyncPill('local', 'Notes are stored only in this browser');
+      }
+
+      if (window.NYCFirebase !== undefined) {
+        start(window.NYCFirebase);
+      } else {
+        window.addEventListener('nyc-firebase-ready', () => start(window.NYCFirebase), { once: true });
+        // safety timeout in case the script never loads
+        setTimeout(() => {
+          if (state.backend === 'local' && !window.NYCFirebase) fallbackLocal();
+          resolve();
+        }, 3500);
+      }
+    });
+  }
+
+  function setSyncPill(kind, title) {
+    const p = el('#sync-pill');
+    if (!p) return;
+    p.classList.remove('is-live', 'is-local');
+    if (kind === 'synced') {
+      p.classList.add('is-live');
+      p.textContent = 'live';
+      p.title = title;
+    } else {
+      p.classList.add('is-local');
+      p.textContent = 'local';
+      p.title = title;
+    }
   }
 
   // ---------- map ----------
@@ -145,7 +225,6 @@
       maxZoom: 18,
     });
 
-    // CARTO dark tiles — free, no key, retina-aware
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
       attribution: '© OpenStreetMap contributors © CARTO · subway/bus shapes © MTA',
       subdomains: 'abcd',
@@ -158,13 +237,29 @@
 
   function setupPanes() {
     const m = state.map;
-    // Stacking order: bus (bottom) → subway → station → labels → markers (top)
-    state.panes.bus      = m.createPane('busPane');      state.panes.bus.style.zIndex      = 380;
-    state.panes.subway   = m.createPane('subwayPane');   state.panes.subway.style.zIndex   = 410;
+    state.panes.bus      = m.createPane('busPane');     state.panes.bus.style.zIndex      = 380;
+    state.panes.subway   = m.createPane('subwayPane');  state.panes.subway.style.zIndex   = 410;
     state.panes.stations = m.createPane('stationPane'); state.panes.stations.style.zIndex = 440;
-    state.panes.labels   = m.createPane('labelPane');    state.panes.labels.style.zIndex   = 460;
+    state.panes.labels   = m.createPane('labelPane');   state.panes.labels.style.zIndex   = 460;
     state.panes.labels.style.pointerEvents = 'none';
-    // Leaflet's default markerPane is z-index 600 → listing markers stay on top.
+    state.panes.landmark = m.createPane('landmarkPane'); state.panes.landmark.style.zIndex = 480;
+  }
+
+  function addNYUBrooklynMarker() {
+    const lat = 40.6942, lng = -73.9866;
+    const icon = L.divIcon({
+      className: '',
+      html: '<div class="landmark-star" aria-label="NYU Brooklyn campus"></div>',
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
+      popupAnchor: [0, -12],
+    });
+    const marker = L.marker([lat, lng], { icon, pane: 'landmarkPane', keyboard: false }).addTo(state.map);
+    marker.bindPopup(
+      '<p class="pop-title">NYU Brooklyn campus</p>' +
+      '<p class="pop-meta">Tandon School of Engineering · 6 MetroTech Center</p>',
+      { closeButton: false, offset: L.point(0, -4) }
+    );
   }
 
   async function loadTransitLayers() {
@@ -184,22 +279,14 @@
         pane: 'subwayPane',
         style: (f) => {
           const raw = (f.properties.service || '').toUpperCase().trim();
-          // normalize "5 Peak" → "5", "SF"/"ST" → "S"
           const key = raw.startsWith('S') ? 'S' : raw.split(/\s+/)[0];
-          return {
-            color: SUBWAY_COLORS[key] || '#888',
-            weight: 3,
-            opacity: 0.9,
-            lineCap: 'round',
-            lineJoin: 'round',
-          };
+          return { color: SUBWAY_COLORS[key] || '#888', weight: 3, opacity: 0.9, lineCap: 'round', lineJoin: 'round' };
         },
         onEachFeature: (f, layer) => {
           const svc = f.properties.service || '?';
-          const name = f.properties.service_name || '';
           layer.bindPopup(
             `<p class="pop-title">${escape(svc)} train</p>` +
-            `<p class="pop-meta">${escape(name)}</p>`,
+            `<p class="pop-meta">${escape(f.properties.service_name || '')}</p>`,
             { closeButton: false, offset: L.point(0, -2) }
           );
         },
@@ -210,8 +297,7 @@
       state.layers.stations = L.geoJSON(stations, {
         pane: 'stationPane',
         pointToLayer: (f, latlng) => {
-          const isComplex = String(f.properties.complex_id || '').length > 0
-            && Number(f.properties.complex_id) > 0;
+          const isComplex = Number(f.properties.complex_id) > 0;
           return L.marker(latlng, {
             pane: 'stationPane',
             icon: L.divIcon({
@@ -230,8 +316,6 @@
             `<p class="pop-meta">${escape(p.daytime_routes || '—')} · ${escape(p.line || '')} · ${escape(p.borough || '')}</p>`,
             { closeButton: false, offset: L.point(0, -6) }
           );
-          layer.on('mouseover', () => layer.openPopup());
-          layer.on('mouseout', () => layer.closePopup());
         },
       }).addTo(state.map);
     }
@@ -241,10 +325,7 @@
         pane: 'busPane',
         style: (f) => ({
           color: '#' + (f.properties.route_color || '888888'),
-          weight: 1.4,
-          opacity: 0.55,
-          lineCap: 'round',
-          lineJoin: 'round',
+          weight: 1.4, opacity: 0.55, lineCap: 'round', lineJoin: 'round',
         }),
         onEachFeature: (f, layer) => {
           const p = f.properties;
@@ -255,10 +336,8 @@
           );
         },
       });
-      // not added by default — toggled on
     }
 
-    // Optional CARTO labels overlay
     state.layers.labels = L.tileLayer(
       'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png',
       { subdomains: 'abcd', maxZoom: 19, pane: 'labelPane' }
@@ -274,10 +353,7 @@
 
   function bindToggle(sel, layer, defaultOn) {
     const cb = el(sel);
-    if (!cb || !layer) {
-      if (cb) cb.disabled = true;
-      return;
-    }
+    if (!cb || !layer) { if (cb) cb.disabled = true; return; }
     cb.checked = defaultOn;
     if (defaultOn && !state.map.hasLayer(layer)) layer.addTo(state.map);
     if (!defaultOn && state.map.hasLayer(layer)) state.map.removeLayer(layer);
@@ -299,10 +375,11 @@
     });
   }
 
+  // ---------- markers ----------
   function buildIcon(l, opts = {}) {
     const tier = priceTier(l);
     const sublet = isSublet(l);
-    const noted = !!(state.notes[l.id] && state.notes[l.id].trim());
+    const noted = (state.noteCounts[l.id] || 0) > 0;
     return L.divIcon({
       className: '',
       html: `<div class="marker${opts.selected ? ' is-selected' : ''}"
@@ -324,9 +401,10 @@
       if (l.lat == null || l.lng == null) return;
       const marker = L.marker([l.lat, l.lng], { icon: buildIcon(l) }).addTo(state.map);
       marker.bindPopup(popupHtml(l), { closeButton: false, offset: L.point(0, -6) });
-      marker.on('click', () => selectListing(l.id));
-      marker.on('mouseover', () => marker.openPopup());
-      marker.on('mouseout', () => marker.closePopup());
+      marker.on('click', () => {
+        marker.closePopup();
+        selectListing(l.id, { fly: false, openSheet: true });
+      });
       state.markers.set(l.id, marker);
     });
 
@@ -335,11 +413,10 @@
   }
 
   function popupHtml(l) {
-    const price = fmtPrice(l);
     const subl = isSublet(l) ? ' · sublet' : '';
     return `
       <p class="pop-title">${escape(l.address || l.title)}</p>
-      <p class="pop-meta">${price}/rm · ${escape(l.neighborhood || '—')}${subl}</p>
+      <p class="pop-meta">${fmtPrice(l)}/rm · ${escape(l.neighborhood || '—')}${subl}</p>
     `;
   }
 
@@ -351,7 +428,11 @@
     });
   }
 
-  // ---------- filters ----------
+  function refreshAllMarkerDots() {
+    refreshSelectedMarker(); // same icon-rebuild path; uses fresh noteCounts
+  }
+
+  // ---------- filters / search ----------
   function setupFilters() {
     const leaseGroups = ['standard', '11mo', 'sublet'];
     const leaseBox = el('#lease-chips');
@@ -456,7 +537,7 @@
         <span class="qa-head">${escape(l.address || l.title)}</span>
         <span class="qa-meta">${fmtPrice(l)} · ${l.miles_to_nyu ?? '—'}mi</span>
       `;
-      li.addEventListener('click', () => selectListing(l.id, { fly: true }));
+      li.addEventListener('click', () => selectListing(l.id, { fly: true, openSheet: true }));
       ul.appendChild(li);
     });
   }
@@ -472,10 +553,13 @@
     }
     refreshSelectedMarker();
     renderDetail(l);
+    closeDrawer();
+    if (opts.openSheet) openSheet();
+    updateSheetSummary();
   }
 
   function renderDetail(l) {
-    const root = el('#detail');
+    const root = el('#detail-scroll');
     const tpl = el('#detail-template').content.cloneNode(true);
     const card = tpl.querySelector('.detail-card');
 
@@ -496,14 +580,12 @@
     grid.appendChild(field('Coords', `${l.lat?.toFixed(4)}, ${l.lng?.toFixed(4)}`, { mono: true }));
     grid.appendChild(field('Last updated', l.last_updated || '—', { mono: true, className: 'span-2' }));
 
-    // Rooms table
     if (Array.isArray(l.rooms) && l.rooms.length) {
       const sec = card.querySelector('.detail-rooms');
       sec.hidden = false;
       sec.querySelector('[data-slot="rooms-table"]').innerHTML = roomsTable(l.rooms);
     }
 
-    // Amenities
     if (Array.isArray(l.amenities) && l.amenities.length) {
       const sec = card.querySelector('.detail-amenities');
       sec.hidden = false;
@@ -515,31 +597,161 @@
       });
     }
 
-    // Notes
-    const notesEl = card.querySelector('[data-slot="notes"]');
-    notesEl.value = state.notes[l.id] || '';
-    notesEl.addEventListener('blur', () => {
-      const v = notesEl.value.trim();
-      if (v) state.notes[l.id] = v; else delete state.notes[l.id];
-      saveStore(STORAGE_NOTES, state.notes);
-      bindText(card, 'note-status', v ? 'saved' : 'cleared');
-      setTimeout(() => bindText(card, 'note-status', ''), 1200);
-      // refresh marker dot for noted state
+    // ----- notes thread -----
+    setupNotesSection(card, l);
+
+    // ----- status chips -----
+    renderStatusChips(card, l);
+
+    // body summary
+    const summarySlot = card.querySelector('[data-slot="summary"]');
+    summarySlot.innerHTML = mdToHtml(l.body_md || '');
+
+    // source link
+    const a = card.querySelector('[data-slot="source-link"]');
+    a.href = '../' + (l.source_file || '');
+
+    root.innerHTML = '';
+    root.appendChild(card);
+    root.scrollTop = 0;
+  }
+
+  // ---------- notes thread ----------
+  function setupNotesSection(card, l) {
+    const threadEl = card.querySelector('[data-slot="thread"]');
+    const composerTa = card.querySelector('[data-slot="composer"]');
+    const postBtn = card.querySelector('[data-action="post-note"]');
+    const authorBadge = card.querySelector('[data-slot="composer-author"]');
+
+    authorBadge.textContent = state.author || 'anonymous';
+
+    const renderThread = (notes) => {
+      state.notesByListing[l.id] = notes;
+      state.noteCounts[l.id] = notes.length;
+      threadEl.innerHTML = '';
+      notes.forEach((n) => threadEl.appendChild(noteCard(n, l)));
+      // refresh marker dot for this listing only
       const m = state.markers.get(l.id);
       if (m) m.setIcon(buildIcon(l, { selected: state.selectedId === l.id }));
-    });
+      updateSheetSummary();
+    };
 
-    card.querySelector('[data-action="clear-note"]').addEventListener('click', () => {
-      notesEl.value = '';
-      delete state.notes[l.id];
-      saveStore(STORAGE_NOTES, state.notes);
-      bindText(card, 'note-status', 'cleared');
-      const m = state.markers.get(l.id);
-      if (m) m.setIcon(buildIcon(l, { selected: state.selectedId === l.id }));
-    });
+    // unsubscribe any prior listener
+    if (state.currentNoteUnsub) { state.currentNoteUnsub(); state.currentNoteUnsub = null; }
 
-    // Status chips
-    const statusBox = card.querySelector('[data-slot="status-chips"]');
+    if (state.backend === 'firebase' && window.NYCFirebase) {
+      state.currentNoteUnsub = window.NYCFirebase.onListingNotes(l.id, renderThread);
+    } else {
+      renderThread(state.notesByListing[l.id] || []);
+    }
+
+    const setStatus = (text, isError) => {
+      const span = card.querySelector('[data-bind="note-status"]');
+      span.textContent = text;
+      span.classList.toggle('is-error', !!isError);
+      if (text) setTimeout(() => { span.textContent = ''; span.classList.remove('is-error'); }, 1800);
+    };
+
+    const post = async () => {
+      const text = composerTa.value.trim();
+      if (!text) return;
+      postBtn.disabled = true;
+      try {
+        if (state.backend === 'firebase' && window.NYCFirebase) {
+          await window.NYCFirebase.addNote(l.id, text, state.author || 'anonymous');
+        } else {
+          // local fallback
+          const list = state.notesByListing[l.id] || [];
+          list.push({
+            id: 'local-' + Date.now(),
+            text,
+            author: state.author || 'you',
+            uid: 'local',
+            createdAt: Date.now(),
+          });
+          state.notesByListing[l.id] = list;
+          saveStore(STORAGE_NOTES, state.notesByListing);
+          renderThread(list);
+        }
+        composerTa.value = '';
+        setStatus('posted');
+      } catch (err) {
+        console.error('post failed', err);
+        setStatus('post failed — ' + (err.message || 'unknown'), true);
+      } finally {
+        postBtn.disabled = false;
+      }
+    };
+
+    postBtn.addEventListener('click', post);
+    composerTa.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); post(); }
+    });
+  }
+
+  function noteCard(n, l) {
+    const li = document.createElement('li');
+    li.className = 'note-card';
+    const isMine = (state.backend === 'firebase')
+      ? (window.NYCFirebase && n.uid && n.uid === window.NYCFirebase.uid)
+      : (n.uid === 'local');
+    if (isMine) li.classList.add('is-mine');
+
+    const head = document.createElement('div');
+    head.className = 'note-head';
+    head.innerHTML = `<span class="note-author">${escape(n.author || 'anonymous')}</span><span class="note-time">${fmtTime(n.createdAt)}</span>`;
+    li.appendChild(head);
+
+    const body = document.createElement('p');
+    body.className = 'note-body';
+    body.textContent = n.text || '';
+    li.appendChild(body);
+
+    if (isMine) {
+      const row = document.createElement('div');
+      row.className = 'note-actions-row';
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = 'delete';
+      del.addEventListener('click', async () => {
+        if (!confirm('Delete this note?')) return;
+        try {
+          if (state.backend === 'firebase' && window.NYCFirebase) {
+            await window.NYCFirebase.deleteNote(l.id, n.id);
+            // Firebase listener will refresh the thread automatically.
+          } else {
+            state.notesByListing[l.id] = (state.notesByListing[l.id] || []).filter((x) => x.id !== n.id);
+            state.noteCounts[l.id] = state.notesByListing[l.id].length;
+            saveStore(STORAGE_NOTES, state.notesByListing);
+            li.remove();
+            const marker = state.markers.get(l.id);
+            if (marker) marker.setIcon(buildIcon(l, { selected: state.selectedId === l.id }));
+            updateSheetSummary();
+          }
+        } catch (err) { console.error('delete failed', err); }
+      });
+      row.appendChild(del);
+      li.appendChild(row);
+    }
+
+    return li;
+  }
+
+  function fmtTime(ms) {
+    if (!ms) return 'just now';
+    const diff = Date.now() - ms;
+    if (diff < 45 * 1000) return 'just now';
+    if (diff < 60 * 60 * 1000) return Math.round(diff / 60000) + 'm';
+    if (diff < 24 * 60 * 60 * 1000) return Math.round(diff / 3600000) + 'h';
+    if (diff < 7 * 24 * 60 * 60 * 1000) return Math.round(diff / 86400000) + 'd';
+    const d = new Date(ms);
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+
+  // ---------- status chips ----------
+  function renderStatusChips(card, l) {
+    const box = card.querySelector('[data-slot="status-chips"]');
+    box.innerHTML = '';
     const current = state.status[l.id];
     STATUS_OPTIONS.forEach((opt) => {
       const c = document.createElement('button');
@@ -547,29 +759,34 @@
       c.className = 'chip';
       c.textContent = opt;
       c.dataset.active = String(current === opt);
-      c.addEventListener('click', () => {
-        if (state.status[l.id] === opt) delete state.status[l.id];
-        else state.status[l.id] = opt;
-        saveStore(STORAGE_STATUS, state.status);
-        renderDetail(l);
+      c.dataset.opt = opt;
+      c.addEventListener('click', async () => {
+        const next = state.status[l.id] === opt ? null : opt;
+        state.status[l.id] = next;
+        if (state.backend === 'firebase' && window.NYCFirebase) {
+          try { await window.NYCFirebase.setStatus(l.id, next); }
+          catch (err) { console.error('status set failed', err); }
+        } else {
+          if (next) state.status[l.id] = next; else delete state.status[l.id];
+          saveStore(STORAGE_STATUS, state.status);
+        }
+        refreshStatusChips();
       });
-      statusBox.appendChild(c);
+      box.appendChild(c);
     });
-
-    // Body summary
-    const summarySlot = card.querySelector('[data-slot="summary"]');
-    summarySlot.innerHTML = mdToHtml(l.body_md || '');
-
-    // Footer link to source markdown
-    const a = card.querySelector('[data-slot="source-link"]');
-    a.href = '../' + (l.source_file || '');
-
-    root.innerHTML = '';
-    root.appendChild(card);
   }
 
+  function refreshStatusChips() {
+    const card = el('#detail-scroll .detail-card');
+    if (!card || !state.selectedId) return;
+    const current = state.status[state.selectedId];
+    els('.status-chips .chip', card).forEach((c) => {
+      c.dataset.active = String(c.dataset.opt === current);
+    });
+  }
+
+  // ---------- detail field helpers ----------
   function field(label, valueHtml, opts = {}) {
-    // Append dt + dd directly so they are grid items (no display:contents trick).
     const frag = document.createDocumentFragment();
     const dt = document.createElement('dt');
     dt.textContent = label;
@@ -586,8 +803,7 @@
   }
 
   function priceCell(l) {
-    const main = fmtPrice(l);
-    return `<span class="price">${main}<small>/ room / mo</small></span>`;
+    return `<span class="price">${fmtPrice(l)}<small>/ room / mo</small></span>`;
   }
 
   function formatContact(l) {
@@ -625,18 +841,13 @@
     const lines = md.split('\n');
     const out = [];
     let inList = false;
-    for (let line of lines) {
+    for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) { if (inList) { out.push('</ul>'); inList = false; } out.push(''); continue; }
-
-      // headings: skip h2 (we already display title); render h3 as <h4>
       if (trimmed.startsWith('### ')) { if (inList) { out.push('</ul>'); inList = false; } out.push(`<p><strong>${escape(trimmed.slice(4))}</strong></p>`); continue; }
       if (trimmed.startsWith('## ')) { if (inList) { out.push('</ul>'); inList = false; } continue; }
       if (trimmed.startsWith('# ')) { continue; }
-
-      // tables: skip — we render rooms table separately and others rarely appear here
       if (trimmed.startsWith('|')) continue;
-
       if (trimmed.startsWith('- ')) {
         if (!inList) { out.push('<ul>'); inList = true; }
         out.push(`<li>${formatInline(trimmed.slice(2))}</li>`);
@@ -659,17 +870,102 @@
     return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
-  // ---------- bindings ----------
-  function bindActions() {
-    // keyboard: esc clears selection
+  // ---------- mobile chrome (drawer + bottom sheet) ----------
+  function setupChrome() {
+    const fab = el('#fab-filters');
+    const close = el('#drawer-close');
+    const scrim = el('#drawer-scrim');
+    const handle = el('#sheet-handle');
+
+    if (fab) fab.addEventListener('click', openDrawer);
+    if (close) close.addEventListener('click', closeDrawer);
+    if (scrim) scrim.addEventListener('click', () => { closeDrawer(); collapseSheet(); });
+    if (handle) handle.addEventListener('click', toggleSheet);
+
+    // Close drawer on Escape; collapse sheet on second Escape
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && state.selectedId) {
+      if (e.key !== 'Escape') return;
+      if (document.body.classList.contains('drawer-open')) { closeDrawer(); return; }
+      if (document.body.classList.contains('sheet-expanded')) { collapseSheet(); return; }
+    });
+
+    // When the map size changes (drawer toggle / orientation), invalidate
+    const ro = new ResizeObserver(() => state.map?.invalidateSize());
+    ro.observe(el('#map'));
+
+    // Initial sheet state on mobile: collapsed (peek)
+    collapseSheet();
+    updateSheetSummary();
+  }
+
+  function openDrawer() {
+    document.body.classList.add('drawer-open');
+    queueMicrotask(() => state.map?.invalidateSize());
+  }
+  function closeDrawer() {
+    document.body.classList.remove('drawer-open');
+    queueMicrotask(() => state.map?.invalidateSize());
+  }
+  function openSheet() {
+    document.body.classList.add('sheet-expanded');
+    queueMicrotask(() => state.map?.invalidateSize());
+  }
+  function collapseSheet() {
+    document.body.classList.remove('sheet-expanded');
+    queueMicrotask(() => state.map?.invalidateSize());
+  }
+  function toggleSheet() {
+    if (document.body.classList.contains('sheet-expanded')) collapseSheet();
+    else openSheet();
+  }
+
+  function updateSheetSummary() {
+    const titleEl = el('#sheet-title');
+    const metaEl  = el('#sheet-meta');
+    if (!titleEl || !metaEl) return;
+    if (state.selectedId) {
+      const l = state.listings.find((x) => x.id === state.selectedId);
+      if (l) {
+        titleEl.textContent = l.address || l.title;
+        const noteN = state.noteCounts[l.id] || 0;
+        const noteStr = noteN ? ` · ${noteN} note${noteN === 1 ? '' : 's'}` : '';
+        metaEl.textContent = `${fmtPrice(l)}/rm · ${l.miles_to_nyu ?? '—'}mi${noteStr}`;
+        return;
+      }
+    }
+    titleEl.textContent = 'All listings';
+    metaEl.textContent = 'tap a marker for details';
+  }
+
+  // ---------- author ----------
+  function setupAuthorInput() {
+    const input = el('#author-input');
+    if (!input) return;
+    input.value = state.author || '';
+    input.addEventListener('change', () => {
+      const v = input.value.trim().slice(0, 40);
+      state.author = v;
+      if (v) localStorage.setItem(STORAGE_AUTHOR, v);
+      else localStorage.removeItem(STORAGE_AUTHOR);
+      // refresh composer byline if open
+      const badge = el('[data-slot="composer-author"]');
+      if (badge) badge.textContent = v || 'anonymous';
+    });
+  }
+
+  // ---------- keyboard ----------
+  function bindKeyboard() {
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && state.selectedId
+          && !document.body.classList.contains('drawer-open')
+          && !document.body.classList.contains('sheet-expanded')) {
         state.selectedId = null;
+        if (state.currentNoteUnsub) { state.currentNoteUnsub(); state.currentNoteUnsub = null; }
         refreshSelectedMarker();
-        // re-render empty state
-        const root = el('#detail');
+        const root = el('#detail-scroll');
         root.innerHTML = '';
         root.appendChild(emptyState());
+        updateSheetSummary();
       }
     });
   }
@@ -679,8 +975,8 @@
     wrap.className = 'detail-empty';
     wrap.innerHTML = `
       <p class="detail-eyebrow">No listing selected</p>
-      <h2>Click a marker to inspect</h2>
-      <p class="detail-help">Each pin is one address. Click for full details, contact info, and a notes field that persists in your browser.</p>
+      <h2>Tap a marker to inspect</h2>
+      <p class="detail-help">Each pin is one address. Click for full details, contact info, status, and a shared notes thread synced across everyone viewing this map.</p>
       <ul id="quick-list" class="quick-list" aria-label="All listings"></ul>
     `;
     queueMicrotask(renderQuickList);

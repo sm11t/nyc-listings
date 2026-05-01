@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a2030" />
   <title>NYC Listings — Brooklyn / Manhattan map</title>
-  <meta name="description" content="A personal map of NYC apartment listings, filterable by price, neighborhood, and lease type. Built to be extended with subway and bus routes." />
+  <meta name="description" content="A personal map of NYC apartment listings, filterable by price, neighborhood, and lease type. Subway and bus routes overlaid; notes synced via Firebase." />
 
   <!-- Leaflet -->
   <link rel="stylesheet"
@@ -23,6 +24,15 @@
         href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" />
 
   <link rel="stylesheet" href="styles.css" />
+
+  <!-- Firebase: config first (regular script, sets window.FIREBASE_CONFIG),
+       then ES-module bridge that initializes the SDK and exposes window.NYCFirebase. -->
+  <script defer src="firebase-config.js"></script>
+  <script type="module" src="firebase.js"></script>
+  <!-- gate.js exposes window.NYCGate.loadListings(); it auto-detects whether
+       to fetch plaintext (dev) or run a password gate against the encrypted
+       blob (portfolio deploy). Must load before app.js. -->
+  <script defer src="gate.js"></script>
   <script defer src="app.js"></script>
 </head>
 <body>
@@ -33,23 +43,44 @@
     </div>
     <div class="meta">
       <span id="count-pill" class="pill">— listings</span>
-      <span id="updated-pill" class="pill subtle">data: <span id="updated-date">—</span></span>
+      <span id="sync-pill" class="pill subtle" title="">local</span>
     </div>
   </header>
 
+  <!-- Mobile floating controls -->
+  <button id="fab-filters" class="fab" type="button" aria-label="Open filters">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="4" y1="6" x2="20" y2="6"/>
+      <line x1="7" y1="12" x2="20" y2="12"/>
+      <line x1="10" y1="18" x2="20" y2="18"/>
+      <circle cx="4" cy="12" r="1.5" fill="currentColor"/>
+      <circle cx="7" cy="18" r="1.5" fill="currentColor"/>
+    </svg>
+    <span>Filters</span>
+  </button>
+
   <main class="layout">
-    <aside class="controls" aria-label="Filters">
+    <button class="scrim" id="drawer-scrim" type="button" aria-label="Close filters" tabindex="-1"></button>
+
+    <aside class="controls" id="controls" aria-label="Filters">
+      <header class="drawer-head">
+        <span class="control-label">Filters &amp; transit</span>
+        <button id="drawer-close" class="icon-btn" type="button" aria-label="Close">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </header>
+
       <section class="control-group">
         <label class="control-label" for="search">Search</label>
-        <input id="search" type="search" placeholder="address, neighborhood, operator…" autocomplete="off" />
+        <input id="search" type="search" placeholder="address, neighborhood, operator…" autocomplete="off" inputmode="search" />
       </section>
 
       <section class="control-group">
         <label class="control-label">Price / room</label>
         <div class="range">
-          <input id="price-min" type="number" placeholder="min" min="0" step="50" />
+          <input id="price-min" type="number" placeholder="min" min="0" step="50" inputmode="numeric" />
           <span class="range-sep">—</span>
-          <input id="price-max" type="number" placeholder="max" min="0" step="50" />
+          <input id="price-max" type="number" placeholder="max" min="0" step="50" inputmode="numeric" />
         </div>
       </section>
 
@@ -86,6 +117,12 @@
         <p class="control-label" style="margin-top:0.85rem">Subway lines</p>
         <ul id="subway-legend" class="subway-legend"></ul>
       </section>
+
+      <section class="control-group identity">
+        <p class="control-label">Your name</p>
+        <input id="author-input" type="text" placeholder="appears on your notes" maxlength="40" autocomplete="nickname" />
+        <p class="hint">Saved on this device. Used as the byline for any notes you post.</p>
+      </section>
     </aside>
 
     <section class="map-wrap">
@@ -93,14 +130,23 @@
     </section>
 
     <aside class="detail" id="detail" aria-live="polite">
-      <div class="detail-empty">
-        <p class="detail-eyebrow">No listing selected</p>
-        <h2>Click a marker to inspect</h2>
-        <p class="detail-help">
-          Each pin is one address. Click for full details, contact info, and a notes
-          field that persists in your browser.
-        </p>
-        <ul id="quick-list" class="quick-list" aria-label="All listings"></ul>
+      <button class="sheet-handle" id="sheet-handle" type="button" aria-label="Toggle detail panel">
+        <span class="sheet-grip"></span>
+        <span class="sheet-summary">
+          <span id="sheet-title">All listings</span>
+          <span id="sheet-meta" class="sheet-meta">tap a marker for details</span>
+        </span>
+      </button>
+      <div class="detail-scroll" id="detail-scroll">
+        <div class="detail-empty">
+          <p class="detail-eyebrow">No listing selected</p>
+          <h2>Tap a marker to inspect</h2>
+          <p class="detail-help">
+            Each pin is one address. Click for full details, contact info, status, and a
+            shared notes thread synced across everyone viewing this map.
+          </p>
+          <ul id="quick-list" class="quick-list" aria-label="All listings"></ul>
+        </div>
       </div>
     </aside>
   </main>
@@ -125,12 +171,15 @@
         <ul data-slot="amenities" class="tag-list"></ul>
       </section>
 
-      <section class="detail-section">
+      <section class="detail-section detail-notes">
         <h3>Notes <span class="note-status" data-bind="note-status"></span></h3>
-        <textarea data-slot="notes" placeholder="Your notes — saved to this browser only."></textarea>
-        <div class="note-actions">
-          <button class="ghost-btn" data-action="clear-note" type="button">clear</button>
-          <span class="hint">Auto-saves on blur. Status updates live.</span>
+        <ul class="thread" data-slot="thread" aria-live="polite"></ul>
+        <div class="composer">
+          <textarea data-slot="composer" placeholder="Add a note — visible to everyone viewing this map." maxlength="2000" rows="2"></textarea>
+          <div class="composer-foot">
+            <span class="hint" data-slot="composer-hint">Posts as <span data-slot="composer-author">anonymous</span></span>
+            <button class="primary-btn" data-action="post-note" type="button">post note</button>
+          </div>
         </div>
       </section>
 
