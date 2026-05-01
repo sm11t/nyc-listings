@@ -172,18 +172,59 @@ def round_trip_check(blob: dict, password: str):
     print(f"        round-trip OK ({len(parsed['listings'])} listings)")
 
 
-def main():
+def git_publish(message: str) -> None:
+    """Stage nyclistings/, commit, and push the portfolio repo. No-ops if
+    there is nothing to commit (so re-runs without changes don't fail)."""
+    print(f"[5/5] git publish in {PORTFOLIO_ROOT}")
+    subprocess.run(["git", "add", "nyclistings"], cwd=PORTFOLIO_ROOT, check=True)
+
+    # Skip commit if working tree is clean for the staged path.
+    diff = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=PORTFOLIO_ROOT,
+    )
+    if diff.returncode == 0:
+        print("        nothing changed — skipping commit/push")
+        return
+
+    subprocess.run(["git", "commit", "-m", message], cwd=PORTFOLIO_ROOT, check=True)
+    subprocess.run(["git", "push"], cwd=PORTFOLIO_ROOT, check=True)
+    print("        pushed")
+
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--push", action="store_true",
+        help="git add/commit/push the portfolio repo after a successful build",
+    )
+    parser.add_argument(
+        "--message", "-m", default="deploy: nyclistings update",
+        help="commit message used when --push is set",
+    )
+    args = parser.parse_args()
+
     password = read_password()
     rebuild_bundles()
     copy_web_to_portfolio()
     blob = encrypt_listings(password)
     write_encrypted(blob)
     round_trip_check(blob, password)
+
     print()
-    print("Done. Commit and push the portfolio repo to publish.")
-    print(f"  cd {PORTFOLIO_ROOT}")
-    print('  git add nyclistings && git commit -m "deploy: nyclistings update"')
-    print("  git push")
+    if args.push:
+        git_publish(args.message)
+        print()
+        print("Done. www.asmit.space/nyclistings will reflect the change "
+              "as soon as the deploy hook fires.")
+    else:
+        print("Done. Commit and push the portfolio repo to publish:")
+        print(f"  cd {PORTFOLIO_ROOT}")
+        print('  git add nyclistings && git commit -m "deploy: nyclistings update"')
+        print("  git push")
+        print()
+        print("Or rerun this script with --push to do all three automatically.")
 
 
 if __name__ == "__main__":

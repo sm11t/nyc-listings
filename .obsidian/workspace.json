@@ -185,6 +185,7 @@
   },
   "active": "1155e608acdaeabc",
   "lastOpenFiles": [
+    "web/data/landmarks.json",
     "scripts/deploy_portfolio.py",
     "web/gate.js",
     "web/firebase.js",
@@ -195,7 +196,6 @@
     "scripts/build_transit.py",
     "web/data/transit/bus-routes.geojson",
     "web/data/transit/subway-stations.geojson",
-    "web/data/transit/subway-lines.geojson",
     "CLAUDE.md",
     "web/README.md",
     "neighborhoods/Bushwick.md",

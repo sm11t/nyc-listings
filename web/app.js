@@ -111,7 +111,7 @@
     await loadTransitLayers();
     setupTransitToggles();
     renderSubwayLegend();
-    addNYUBrooklynMarker();
+    await loadLandmarks();
 
     await initBackend();
     setupAuthorInput();
@@ -245,21 +245,55 @@
     state.panes.landmark = m.createPane('landmarkPane'); state.panes.landmark.style.zIndex = 480;
   }
 
-  function addNYUBrooklynMarker() {
-    const lat = 40.6942, lng = -73.9866;
+  async function loadLandmarks() {
+    if (!state.map) return;
+    let payload;
+    try {
+      const r = await fetch('data/landmarks.json');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      payload = await r.json();
+    } catch (err) {
+      console.warn('landmarks.json failed to load', err);
+      return;
+    }
+    const list = Array.isArray(payload?.landmarks) ? payload.landmarks : [];
+    list.forEach(addLandmarkMarker);
+  }
+
+  function addLandmarkMarker(lm) {
+    if (lm.lat == null || lm.lng == null) return;
+    const html = landmarkIconHtml(lm.kind || 'star', lm.name || '');
     const icon = L.divIcon({
-      className: '',
-      html: '<div class="landmark-star" aria-label="NYU Brooklyn campus"></div>',
-      iconSize: [28, 28],
-      iconAnchor: [14, 14],
+      className: 'landmark-icon',
+      html,
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
       popupAnchor: [0, -12],
     });
-    const marker = L.marker([lat, lng], { icon, pane: 'landmarkPane', keyboard: false }).addTo(state.map);
+    const marker = L.marker([lm.lat, lm.lng], {
+      icon,
+      pane: 'landmarkPane',
+      keyboard: false,
+      title: lm.name || '',
+    }).addTo(state.map);
+    const subtitle = [lm.subtitle, lm.address].filter(Boolean).map(escape).join(' · ');
     marker.bindPopup(
-      '<p class="pop-title">NYU Brooklyn campus</p>' +
-      '<p class="pop-meta">Tandon School of Engineering · 6 MetroTech Center</p>',
+      `<p class="pop-title">${escape(lm.name || '')}</p>` +
+      (subtitle ? `<p class="pop-meta">${subtitle}</p>` : ''),
       { closeButton: false, offset: L.point(0, -4) }
     );
+  }
+
+  function landmarkIconHtml(kind, label) {
+    if (kind === 'star') {
+      return (
+        `<svg class="landmark-star" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="30" height="30" aria-label="${escape(label)}">` +
+        '<path d="M12 2 L14.6 8.6 L21.8 9.27 L16.3 14.14 L17.95 21 L12 17.27 L6.05 21 L7.7 14.14 L2.2 9.27 L9.4 8.6 Z" ' +
+        'fill="#ffffff" stroke="#000" stroke-width="0.8" stroke-linejoin="round"/>' +
+        '</svg>'
+      );
+    }
+    return `<div class="landmark-dot" title="${escape(label)}"></div>`;
   }
 
   async function loadTransitLayers() {

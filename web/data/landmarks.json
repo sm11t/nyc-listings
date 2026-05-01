@@ -1,0 +1,14 @@
+{
+  "_note": "Static landmarks rendered on the map. Add entries here, not in app.js. Each entry: { id, name, kind, lat, lng, address?, subtitle? }. 'kind' controls the icon — currently 'star' (white star) is the only style; extend in app.js when more are needed.",
+  "landmarks": [
+    {
+      "id": "nyu-brooklyn",
+      "name": "NYU Brooklyn campus",
+      "kind": "star",
+      "lat": 40.6942,
+      "lng": -73.9866,
+      "address": "6 MetroTech Center, Brooklyn, NY 11201",
+      "subtitle": "Tandon School of Engineering"
+    }
+  ]
+}
